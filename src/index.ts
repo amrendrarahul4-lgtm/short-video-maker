@@ -13,6 +13,84 @@ import { logger } from "./logger";
 import { Server } from "./server/server";
 import { MusicManager } from "./short-creator/music";
 
+
+
+/**
+ * Verifies that all external dependencies are reachable.
+ * Returns a summary of which checks passed/failed without throwing.
+ * The service starts in degraded mode if any check fails — it will keep
+ * retrying in the background.
+ */
+async function runHealthChecks(
+  kokoro: Kokoro,
+  ffmpeg: FFMpeg,
+  pexelsApi: PexelsAPI,
+  remotion: Remotion,
+  config: Config,
+): Promise<{ allPassed: boolean; results: Record<string, boolean> }> {
+  const results: Record<string, boolean> = {};
+
+  // 1. FFmpeg — generate a tiny silence WAV
+  try {
+    const silence = ShortCreator.createSilenceAudio(0.1);
+    const testWavPath = path.join(config.tempDirPath, `healthcheck-${Date.now()}.wav`);
+    await ffmpeg.saveNormalizedAudio(silence.audio, testWavPath);
+    fs.removeSync(testWavPath);
+    results["ffmpeg"] = true;
+    logger.info("Health check passed: FFmpeg");
+  } catch (err: unknown) {
+    results["ffmpeg"] = false;
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      "Health check failed: FFmpeg",
+    );
+  }
+
+  // 2. Kokoro TTS — generate a very short phrase
+  try {
+    await kokoro.generate("hi", "af_heart");
+    results["kokoro"] = true;
+    logger.info("Health check passed: Kokoro TTS");
+  } catch (err: unknown) {
+    results["kokoro"] = false;
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      "Health check failed: Kokoro TTS",
+    );
+  }
+
+  // 3. Pexels API — search for a short clip
+  try {
+    await pexelsApi.findVideo(["dog"], 2.4);
+    results["pexels"] = true;
+    logger.info("Health check passed: Pexels API");
+  } catch (err: unknown) {
+    results["pexels"] = false;
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      "Health check failed: Pexels API",
+    );
+  }
+
+  // 4. Remotion — test render
+  try {
+    const testVideoPath = path.join(config.tempDirPath, `healthcheck-${Date.now()}.mp4`);
+    await remotion.testRender(testVideoPath);
+    fs.rmSync(testVideoPath, { force: true });
+    results["remotion"] = true;
+    logger.info("Health check passed: Remotion test render");
+  } catch (err: unknown) {
+    results["remotion"] = false;
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      "Health check failed: Remotion test render",
+    );
+  }
+
+  const allPassed = Object.values(results).every(Boolean);
+  return { allPassed, results };
+}
+
 async function main() {
   const config = new Config();
   try {
@@ -78,6 +156,27 @@ async function main() {
         );
         process.exit(1);
       }
+    }
+  } else {
+    // Running in Docker — run health checks but start in degraded mode if any fail
+    logger.info("Running in Docker — performing startup health checks");
+    const { allPassed, results } = await runHealthChecks(
+      kokoro,
+      ffmpeg,
+      pexelsApi,
+      remotion,
+      config,
+    );
+
+    if (allPassed) {
+      logger.info({ results }, "All startup health checks passed");
+    } else {
+      logger.warn(
+        { results },
+        "Some startup health checks failed — starting in degraded mode. " +
+          "The service will still accept requests; individual render steps " +
+          "will retry automatically.",
+      );
     }
   }
 

@@ -14,6 +14,7 @@ import { PexelsAPI } from "./libraries/Pexels";
 import { Config } from "../config";
 import { logger } from "../logger";
 import { MusicManager } from "./music";
+import { sleep } from "./libraries/retry";
 import type {
   SceneInput,
   RenderConfig,
@@ -27,12 +28,30 @@ import type {
 /** Maximum time (ms) to wait for a single video render before aborting. */
 const RENDER_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
+/** Maximum number of times a queue item will be retried before being abandoned. */
+const MAX_QUEUE_RETRIES = 5;
+
+/** Base delay (ms) for queue-level exponential backoff between job retries. */
+const QUEUE_RETRY_BASE_DELAY_MS = 5_000;
+
+/** Maximum delay (ms) between queue-level retries. */
+const QUEUE_RETRY_MAX_DELAY_MS = 5 * 60 * 1000; // 5 minutes
+
+/** Maximum number of attempts to download a single Pexels video. */
+const PEXELS_DOWNLOAD_MAX_ATTEMPTS = 3;
+
+
 export class ShortCreator {
   private queue: {
     sceneInput: SceneInput[];
     config: RenderConfig;
     id: string;
+    /** Number of times this job has already failed and been re-queued. */
+    retryCount: number;
+    /** Timestamp (ms) before which this job should not be processed again. */
+    nextRetryAt: number;
   }[] = [];
+
   constructor(
     private config: Config,
     private remotion: Remotion,
@@ -61,6 +80,8 @@ export class ShortCreator {
       sceneInput,
       config,
       id,
+      retryCount: 0,
+      nextRetryAt: 0,
     });
     logger.info(
       {
@@ -82,28 +103,76 @@ export class ShortCreator {
     if (this.queue.length === 0) {
       return;
     }
-    const { sceneInput, config, id } = this.queue[0];
+
+    const item = this.queue[0];
+    const { sceneInput, config, id, retryCount, nextRetryAt } = item;
+
+    // If this item has a backoff delay, wait until it has elapsed
+    const now = Date.now();
+    if (nextRetryAt > now) {
+      const waitMs = nextRetryAt - now;
+      logger.info(
+        { videoId: id, retryCount, waitMs },
+        "Queue item is in backoff — waiting before next attempt",
+      );
+      await sleep(waitMs);
+    }
+
     logger.info(
-      { videoId: id, sceneInput, config, queueLength: this.queue.length },
+      { videoId: id, sceneInput, config, queueLength: this.queue.length, retryCount },
       "Processing video item in the queue",
     );
+
     try {
       await this.createShort(id, sceneInput, config);
       logger.info({ videoId: id }, "Video created successfully");
-    } catch (error: unknown) {
-      logger.error(
-        {
-          videoId: id,
-          err: error instanceof Error ? error.message : String(error),
-          stack: error instanceof Error ? error.stack : undefined,
-        },
-        "Error creating video — item removed from queue",
-      );
-    } finally {
+      // Success — remove from front of queue
       this.queue.shift();
-      this.processQueue();
+    } catch (error: unknown) {
+      const newRetryCount = retryCount + 1;
+
+      if (newRetryCount > MAX_QUEUE_RETRIES) {
+        logger.error(
+          {
+            videoId: id,
+            retryCount: newRetryCount,
+            maxRetries: MAX_QUEUE_RETRIES,
+            err: error instanceof Error ? error.message : String(error),
+            stack: error instanceof Error ? error.stack : undefined,
+          },
+          "Video creation failed — max retries reached, removing from queue",
+        );
+        this.queue.shift();
+      } else {
+        const delayMs = Math.min(
+          QUEUE_RETRY_BASE_DELAY_MS * Math.pow(2, retryCount),
+          QUEUE_RETRY_MAX_DELAY_MS,
+        );
+        logger.warn(
+          {
+            videoId: id,
+            retryCount: newRetryCount,
+            maxRetries: MAX_QUEUE_RETRIES,
+            nextRetryDelayMs: delayMs,
+            err: error instanceof Error ? error.message : String(error),
+            stack: error instanceof Error ? error.stack : undefined,
+          },
+          "Video creation failed — moving to back of queue for retry",
+        );
+        // Remove from front and push to back with updated retry metadata
+        this.queue.shift();
+        this.queue.push({
+          ...item,
+          retryCount: newRetryCount,
+          nextRetryAt: Date.now() + delayMs,
+        });
+      }
     }
+
+    // Continue processing the queue
+    this.processQueue();
   }
+
 
   private async createShort(
     videoId: string,
@@ -163,10 +232,11 @@ export class ShortCreator {
       };
       logger.info(sceneCtx, "Processing scene");
 
-      // ── Step 1: TTS (Kokoro) ─────────────────────────────────────────────
+      // ── Step 1: TTS (Kokoro) — with silence fallback ─────────────────────
       let audio: { audio: ArrayBuffer; audioLength: number };
       try {
         logger.debug({ ...sceneCtx, voice: config.voice }, "Generating TTS audio with Kokoro");
+        // Kokoro.generate() already retries internally (up to 3 attempts)
         audio = await this.kokoro.generate(
           scene.text,
           config.voice ?? "af_heart",
@@ -176,15 +246,15 @@ export class ShortCreator {
           "Kokoro TTS audio generated",
         );
       } catch (err: unknown) {
-        logger.error(
+        // All Kokoro retries exhausted — fall back to a 3-second silence WAV
+        logger.warn(
           {
             ...sceneCtx,
             err: err instanceof Error ? err.message : String(err),
-            stack: err instanceof Error ? err.stack : undefined,
           },
-          "Kokoro TTS generation failed",
+          "Kokoro TTS failed after all retries — using silence fallback",
         );
-        throw err;
+        audio = ShortCreator.createSilenceAudio(3);
       }
 
       let { audioLength } = audio;
@@ -209,6 +279,7 @@ export class ShortCreator {
       tempFiles.push(tempWavPath, tempMp3Path);
 
       // ── Step 2: Save normalised WAV for Whisper ──────────────────────────
+      // FFmpeg.saveNormalizedAudio() already retries internally (up to 3 attempts)
       try {
         logger.debug({ ...sceneCtx, tempWavPath }, "Saving normalised WAV");
         await this.ffmpeg.saveNormalizedAudio(audioStream, tempWavPath);
@@ -225,12 +296,13 @@ export class ShortCreator {
             err: err instanceof Error ? err.message : String(err),
             stack: err instanceof Error ? err.stack : undefined,
           },
-          "Failed to save normalised WAV",
+          "Failed to save normalised WAV — this is unrecoverable, re-throwing",
         );
         throw err;
       }
 
-      // ── Step 3: Whisper captioning ───────────────────────────────────────
+      // ── Step 3: Whisper captioning — with empty-caption fallback ─────────
+      // Whisper.CreateCaption() already retries internally (up to 3 attempts)
       let captions;
       try {
         logger.debug({ ...sceneCtx, tempWavPath }, "Running Whisper captioning");
@@ -240,19 +312,20 @@ export class ShortCreator {
           "Whisper captioning complete",
         );
       } catch (err: unknown) {
-        logger.error(
+        // All Whisper retries exhausted — degrade gracefully with empty captions
+        logger.warn(
           {
             ...sceneCtx,
             tempWavPath,
             err: err instanceof Error ? err.message : String(err),
-            stack: err instanceof Error ? err.stack : undefined,
           },
-          "Whisper captioning failed",
+          "Whisper captioning failed after all retries — using empty captions fallback",
         );
-        throw err;
+        captions = [];
       }
 
       // ── Step 4: Save MP3 for Remotion ────────────────────────────────────
+      // FFmpeg.saveToMp3() already retries internally with codec fallbacks
       try {
         logger.debug({ ...sceneCtx, tempMp3Path }, "Saving MP3 audio");
         await this.ffmpeg.saveToMp3(audioStream, tempMp3Path);
@@ -269,12 +342,13 @@ export class ShortCreator {
             err: err instanceof Error ? err.message : String(err),
             stack: err instanceof Error ? err.stack : undefined,
           },
-          "Failed to save MP3 audio",
+          "Failed to save MP3 audio — this is unrecoverable, re-throwing",
         );
         throw err;
       }
 
       // ── Step 5: Find Pexels video ────────────────────────────────────────
+      // PexelsAPI.findVideo() already has its own retry/fallback-term logic
       let video: { url: string; id: string };
       try {
         logger.debug(
@@ -300,122 +374,167 @@ export class ShortCreator {
             err: err instanceof Error ? err.message : String(err),
             stack: err instanceof Error ? err.stack : undefined,
           },
-          "Pexels video search failed",
+          "Pexels video search failed — this is unrecoverable, re-throwing",
         );
         throw err;
       }
 
-      // ── Step 6: Download Pexels video ────────────────────────────────────
-      logger.debug(
-        { ...sceneCtx, videoUrl: video.url, tempVideoPath },
-        "Downloading Pexels video",
-      );
-      try {
-        await new Promise<void>((resolve, reject) => {
-          const fileStream = fs.createWriteStream(tempVideoPath);
-          https
-            .get(video.url, (response: http.IncomingMessage) => {
-              if (response.statusCode !== 200) {
-                const dlErr = new Error(
-                  `Failed to download Pexels video: HTTP ${response.statusCode} from ${video.url}`,
-                );
-                logger.error(
-                  {
-                    ...sceneCtx,
-                    videoUrl: video.url,
-                    statusCode: response.statusCode,
-                  },
-                  dlErr.message,
-                );
-                reject(dlErr);
-                return;
-              }
+      // ── Step 6: Download Pexels video — with per-attempt retry ───────────
+      // On each download failure we fetch a fresh video URL from Pexels so we
+      // are not retrying the same potentially-expired CDN link.
+      let downloadedVideoId = video.id;
+      {
+        let downloadAttempt = 0;
+        let currentVideo = video;
+        let downloadSuccess = false;
+        const downloadExcludeIds = [...excludeVideoIds];
 
-              response.pipe(fileStream);
+        while (downloadAttempt < PEXELS_DOWNLOAD_MAX_ATTEMPTS) {
+          downloadAttempt++;
+          logger.debug(
+            { ...sceneCtx, videoUrl: currentVideo.url, tempVideoPath, downloadAttempt },
+            "Downloading Pexels video",
+          );
 
-              fileStream.on("finish", () => {
-                fileStream.close();
-                try {
-                  const dlStat = fs.statSync(tempVideoPath);
-                  if (dlStat.size === 0) {
-                    const emptyErr = new Error(
-                      `Downloaded Pexels video is empty (0 bytes): ${tempVideoPath}`,
+          try {
+            // Remove any partial file from a previous failed attempt
+            try {
+              if (fs.existsSync(tempVideoPath)) fs.removeSync(tempVideoPath);
+            } catch (_) {}
+
+            await new Promise<void>((resolve, reject) => {
+              const fileStream = fs.createWriteStream(tempVideoPath);
+              https
+                .get(currentVideo.url, (response: http.IncomingMessage) => {
+                  if (response.statusCode !== 200) {
+                    const dlErr = new Error(
+                      `Failed to download Pexels video: HTTP ${response.statusCode} from ${currentVideo.url}`,
                     );
                     logger.error(
-                      { ...sceneCtx, tempVideoPath },
-                      emptyErr.message,
+                      {
+                        ...sceneCtx,
+                        videoUrl: currentVideo.url,
+                        statusCode: response.statusCode,
+                        downloadAttempt,
+                      },
+                      dlErr.message,
                     );
-                    return reject(emptyErr);
+                    reject(dlErr);
+                    return;
                   }
-                  logger.debug(
-                    {
-                      ...sceneCtx,
-                      tempVideoPath,
-                      fileSizeBytes: dlStat.size,
-                    },
-                    "Pexels video downloaded successfully",
-                  );
-                  resolve();
-                } catch (statErr: unknown) {
+
+                  response.pipe(fileStream);
+
+                  fileStream.on("finish", () => {
+                    fileStream.close();
+                    try {
+                      const dlStat = fs.statSync(tempVideoPath);
+                      if (dlStat.size === 0) {
+                        return reject(
+                          new Error(
+                            `Downloaded Pexels video is empty (0 bytes): ${tempVideoPath}`,
+                          ),
+                        );
+                      }
+                      logger.debug(
+                        {
+                          ...sceneCtx,
+                          tempVideoPath,
+                          fileSizeBytes: dlStat.size,
+                          downloadAttempt,
+                        },
+                        "Pexels video downloaded successfully",
+                      );
+                      resolve();
+                    } catch (statErr: unknown) {
+                      reject(statErr);
+                    }
+                  });
+
+                  fileStream.on("error", (streamErr: Error) => {
+                    logger.error(
+                      {
+                        ...sceneCtx,
+                        tempVideoPath,
+                        err: streamErr.message,
+                        downloadAttempt,
+                      },
+                      "File stream error while downloading Pexels video",
+                    );
+                    fs.unlink(tempVideoPath, () => {});
+                    reject(streamErr);
+                  });
+                })
+                .on("error", (err: Error) => {
                   logger.error(
                     {
                       ...sceneCtx,
+                      videoUrl: currentVideo.url,
                       tempVideoPath,
-                      err:
-                        statErr instanceof Error
-                          ? statErr.message
-                          : String(statErr),
+                      err: err.message,
+                      downloadAttempt,
                     },
-                    "Error verifying downloaded video file",
+                    "HTTPS request error downloading Pexels video",
                   );
-                  reject(statErr);
-                }
-              });
+                  fs.unlink(tempVideoPath, () => {});
+                  reject(err);
+                });
+            });
 
-              fileStream.on("error", (streamErr: Error) => {
+            downloadedVideoId = currentVideo.id;
+            downloadSuccess = true;
+            break; // download succeeded
+          } catch (dlErr: unknown) {
+            logger.warn(
+              {
+                ...sceneCtx,
+                videoUrl: currentVideo.url,
+                downloadAttempt,
+                maxAttempts: PEXELS_DOWNLOAD_MAX_ATTEMPTS,
+                err: dlErr instanceof Error ? dlErr.message : String(dlErr),
+              },
+              "Pexels video download failed — will try a different video",
+            );
+
+            if (downloadAttempt < PEXELS_DOWNLOAD_MAX_ATTEMPTS) {
+              // Exclude the failed video and search for a fresh one
+              downloadExcludeIds.push(currentVideo.id);
+              const delayMs = 1000 * downloadAttempt;
+              await sleep(delayMs);
+              try {
+                currentVideo = await this.pexelsApi.findVideo(
+                  scene.searchTerms,
+                  audioLength,
+                  downloadExcludeIds,
+                  orientation,
+                );
+                logger.debug(
+                  { ...sceneCtx, newVideoUrl: currentVideo.url, downloadAttempt },
+                  "Found replacement Pexels video for retry",
+                );
+              } catch (searchErr: unknown) {
                 logger.error(
                   {
                     ...sceneCtx,
-                    tempVideoPath,
-                    err: streamErr.message,
-                    stack: streamErr.stack,
+                    err: searchErr instanceof Error ? searchErr.message : String(searchErr),
+                    downloadAttempt,
                   },
-                  "File stream error while downloading Pexels video",
+                  "Could not find replacement Pexels video — giving up on download retries",
                 );
-                fs.unlink(tempVideoPath, () => {});
-                reject(streamErr);
-              });
-            })
-            .on("error", (err: Error) => {
-              logger.error(
-                {
-                  ...sceneCtx,
-                  videoUrl: video.url,
-                  tempVideoPath,
-                  err: err.message,
-                  stack: err.stack,
-                },
-                "HTTPS request error downloading Pexels video",
-              );
-              fs.unlink(tempVideoPath, () => {});
-              reject(err);
-            });
-        });
-      } catch (err: unknown) {
-        logger.error(
-          {
-            ...sceneCtx,
-            videoUrl: video.url,
-            tempVideoPath,
-            err: err instanceof Error ? err.message : String(err),
-            stack: err instanceof Error ? err.stack : undefined,
-          },
-          "Pexels video download failed",
-        );
-        throw err;
+                break;
+              }
+            }
+          }
+        }
+
+        if (!downloadSuccess) {
+          throw new Error(
+            `Failed to download a Pexels video for scene ${index} after ${PEXELS_DOWNLOAD_MAX_ATTEMPTS} attempts`,
+          );
+        }
       }
 
-      excludeVideoIds.push(video.id);
+      excludeVideoIds.push(downloadedVideoId);
 
       scenes.push({
         captions,
@@ -445,6 +564,7 @@ export class ShortCreator {
     );
 
     // ── Step 7: Remotion render with timeout ─────────────────────────────
+    // Remotion.render() already retries internally with degraded settings
     logger.info(
       {
         videoId,
@@ -497,6 +617,7 @@ export class ShortCreator {
       );
       throw err;
     }
+
 
     // ── Step 8: Verify final output file ────────────────────────────────
     const finalOutputPath = this.getVideoPath(videoId);
@@ -577,6 +698,46 @@ export class ShortCreator {
     });
     return musicFiles[Math.floor(Math.random() * musicFiles.length)];
   }
+
+  /**
+   * Generates a minimal PCM WAV buffer containing `durationSeconds` of silence.
+   * Used as a fallback when Kokoro TTS fails after all retries.
+   */
+  static createSilenceAudio(durationSeconds: number): {
+    audio: ArrayBuffer;
+    audioLength: number;
+  } {
+    const sampleRate = 16000;
+    const numChannels = 1;
+    const bitsPerSample = 16;
+    const numSamples = Math.floor(sampleRate * durationSeconds);
+    const dataSize = numSamples * numChannels * (bitsPerSample / 8);
+    const buffer = Buffer.alloc(44 + dataSize, 0);
+
+    // RIFF header
+    buffer.write("RIFF", 0);
+    buffer.writeUInt32LE(36 + dataSize, 4);
+    buffer.write("WAVE", 8);
+    // fmt chunk
+    buffer.write("fmt ", 12);
+    buffer.writeUInt32LE(16, 16); // chunk size
+    buffer.writeUInt16LE(1, 20);  // PCM format
+    buffer.writeUInt16LE(numChannels, 22);
+    buffer.writeUInt32LE(sampleRate, 24);
+    buffer.writeUInt32LE(sampleRate * numChannels * (bitsPerSample / 8), 28); // byte rate
+    buffer.writeUInt16LE(numChannels * (bitsPerSample / 8), 32); // block align
+    buffer.writeUInt16LE(bitsPerSample, 34);
+    // data chunk
+    buffer.write("data", 36);
+    buffer.writeUInt32LE(dataSize, 40);
+    // samples are already zero (silence)
+
+    return {
+      audio: buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength),
+      audioLength: durationSeconds,
+    };
+  }
+
 
   public ListAvailableMusicTags(): MusicTag[] {
     const tags = new Set<MusicTag>();

@@ -5,6 +5,8 @@ import {
   type Voices,
 } from "../../types/shorts";
 import { KOKORO_MODEL, logger } from "../../config";
+import { withRetry } from "./retry";
+
 
 export class Kokoro {
   constructor(private tts: KokoroTTS) {}
@@ -16,33 +18,44 @@ export class Kokoro {
     audio: ArrayBuffer;
     audioLength: number;
   }> {
-    const splitter = new TextSplitterStream();
-    const stream = this.tts.stream(splitter, {
-      voice,
-    });
-    splitter.push(text);
-    splitter.close();
+    return withRetry(
+      async () => {
+        const splitter = new TextSplitterStream();
+        const stream = this.tts.stream(splitter, {
+          voice,
+        });
+        splitter.push(text);
+        splitter.close();
 
-    const output = [];
-    for await (const audio of stream) {
-      output.push(audio);
-    }
+        const output = [];
+        for await (const audio of stream) {
+          output.push(audio);
+        }
 
-    const audioBuffers: ArrayBuffer[] = [];
-    let audioLength = 0;
-    for (const audio of output) {
-      audioBuffers.push(audio.audio.toWav());
-      audioLength += audio.audio.audio.length / audio.audio.sampling_rate;
-    }
+        const audioBuffers: ArrayBuffer[] = [];
+        let audioLength = 0;
+        for (const audio of output) {
+          audioBuffers.push(audio.audio.toWav());
+          audioLength += audio.audio.audio.length / audio.audio.sampling_rate;
+        }
 
-    const mergedAudioBuffer = Kokoro.concatWavBuffers(audioBuffers);
-    logger.debug({ text, voice, audioLength }, "Audio generated with Kokoro");
+        const mergedAudioBuffer = Kokoro.concatWavBuffers(audioBuffers);
+        logger.debug({ text, voice, audioLength }, "Audio generated with Kokoro");
 
-    return {
-      audio: mergedAudioBuffer,
-      audioLength: audioLength,
-    };
+        return {
+          audio: mergedAudioBuffer,
+          audioLength: audioLength,
+        };
+      },
+      {
+        label: "Kokoro TTS generate",
+        maxAttempts: 3,
+        baseDelayMs: 1000,
+        context: { voice, textLength: text.length },
+      },
+    );
   }
+
 
   static concatWavBuffers(buffers: ArrayBuffer[]): ArrayBuffer {
     const header = Buffer.from(buffers[0].slice(0, 44));
