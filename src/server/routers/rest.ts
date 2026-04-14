@@ -198,25 +198,59 @@ export class APIRouter {
     this.router.get(
       "/short-video/:videoId",
       (req: ExpressRequest, res: ExpressResponse) => {
+        const { videoId } = req.params;
+        if (!videoId) {
+          res.status(400).json({
+            error: "videoId is required",
+          });
+          return;
+        }
+
+        const videoPath = this.shortCreator.getVideoPath(videoId);
+        if (!fs.existsSync(videoPath)) {
+          logger.warn(
+            { videoId, videoPath },
+            "Video file not found on disk",
+          );
+          res.status(404).json({
+            error: "Video not found",
+            videoId,
+          });
+          return;
+        }
+
         try {
-          const { videoId } = req.params;
-          if (!videoId) {
-            res.status(400).json({
-              error: "videoId is required",
-            });
-            return;
-          }
-          const video = this.shortCreator.getVideo(videoId);
+          const stat = fs.statSync(videoPath);
           res.setHeader("Content-Type", "video/mp4");
+          res.setHeader("Content-Length", stat.size);
           res.setHeader(
             "Content-Disposition",
             `inline; filename=${videoId}.mp4`,
           );
-          res.send(video);
+
+          const videoStream = fs.createReadStream(videoPath);
+          videoStream.on("error", (streamError: Error) => {
+            logger.error(
+              { videoId, videoPath, err: streamError.message },
+              "Error streaming video file",
+            );
+            if (!res.headersSent) {
+              res.status(500).json({ error: "Error streaming video" });
+            }
+          });
+          videoStream.pipe(res);
         } catch (error: unknown) {
-          logger.error(error, "Error getting video");
-          res.status(404).json({
-            error: "Video not found",
+          logger.error(
+            {
+              videoId,
+              videoPath,
+              err: error instanceof Error ? error.message : String(error),
+            },
+            "Error getting video",
+          );
+          res.status(500).json({
+            error: "Error getting video",
+            videoId,
           });
         }
       },
