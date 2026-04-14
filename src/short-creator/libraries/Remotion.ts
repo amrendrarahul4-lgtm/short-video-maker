@@ -10,6 +10,9 @@ import { shortVideoSchema } from "../../components/utils";
 import { logger } from "../../logger";
 import { OrientationEnum } from "../../types/shorts";
 import { getOrientationConfig } from "../../components/utils";
+import { sleep } from "./retry";
+
+
 
 export class Remotion {
   constructor(
@@ -129,70 +132,110 @@ export class Remotion {
       throw err;
     }
 
-    try {
-      await renderMedia({
-        codec: "h264",
-        composition,
-        serveUrl: this.bundled,
-        outputLocation,
-        inputProps: data,
-        onProgress: ({ progress }) => {
-          logger.debug(
-            { videoID: id, progressPct: Math.floor(progress * 100) },
-            `Rendering ${id} ${Math.floor(progress * 100)}% complete`,
-          );
-        },
-        // preventing memory issues with docker
-        concurrency: this.config.concurrency,
-        offthreadVideoCacheSizeInBytes: this.config.videoCacheSizeInBytes,
-      });
-    } catch (err: unknown) {
-      logger.error(
-        {
-          videoID: id,
-          component,
+    /**
+     * Attempt renderMedia with progressively degraded settings on each retry:
+     *   attempt 1 — normal quality (h264, full concurrency, full cache)
+     *   attempt 2 — reduced concurrency (1) and no cache
+     *   attempt 3 — hevc codec, concurrency 1, no cache
+     */
+    const maxRenderAttempts = 3;
+    let lastRenderError: unknown;
+
+    for (let attempt = 1; attempt <= maxRenderAttempts; attempt++) {
+      // Remove any partial output file from a previous failed attempt
+      try {
+        if (fs.existsSync(outputLocation)) {
+          fs.removeSync(outputLocation);
+        }
+      } catch (_) {
+        // ignore cleanup errors
+      }
+
+      const isRetry = attempt > 1;
+      const codec: "h264" | "h265" = attempt >= 3 ? "h265" : "h264";
+      const concurrency = isRetry ? 1 : this.config.concurrency;
+      const cacheSize = isRetry ? 0 : this.config.videoCacheSizeInBytes;
+
+      if (isRetry) {
+        const delayMs = 2000 * Math.pow(2, attempt - 2); // 2s, 4s
+        logger.warn(
+          {
+            videoID: id,
+            attempt,
+            maxRenderAttempts,
+            codec,
+            concurrency,
+            nextRetryDelayMs: delayMs,
+            err:
+              lastRenderError instanceof Error
+                ? lastRenderError.message
+                : String(lastRenderError),
+          },
+          `Remotion render failed on attempt ${attempt - 1} — retrying with degraded settings in ${delayMs}ms`,
+        );
+        await sleep(delayMs);
+      }
+
+      try {
+        await renderMedia({
+          codec,
+          composition,
+          serveUrl: this.bundled,
           outputLocation,
-          err: err instanceof Error ? err.message : String(err),
-          stack: err instanceof Error ? err.stack : undefined,
-        },
-        "Remotion renderMedia failed",
-      );
-      throw err;
+          inputProps: data,
+          onProgress: ({ progress }) => {
+            logger.debug(
+              { videoID: id, progressPct: Math.floor(progress * 100), attempt },
+              `Rendering ${id} ${Math.floor(progress * 100)}% complete (attempt ${attempt})`,
+            );
+          },
+          concurrency,
+          offthreadVideoCacheSizeInBytes: cacheSize,
+        });
+
+        // Verify the output file was actually created with non-zero size
+        if (!fs.existsSync(outputLocation)) {
+          throw new Error(
+            `Remotion render completed but output file is missing: ${outputLocation}`,
+          );
+        }
+        const stat = fs.statSync(outputLocation);
+        if (stat.size === 0) {
+          throw new Error(
+            `Remotion render completed but output file is empty (0 bytes): ${outputLocation}`,
+          );
+        }
+
+        logger.info(
+          {
+            outputLocation,
+            component,
+            videoID: id,
+            fileSizeBytes: stat.size,
+            attempt,
+          },
+          "Video rendered successfully with Remotion",
+        );
+        return; // success
+      } catch (err: unknown) {
+        lastRenderError = err;
+        logger.error(
+          {
+            videoID: id,
+            component,
+            outputLocation,
+            attempt,
+            codec,
+            err: err instanceof Error ? err.message : String(err),
+            stack: err instanceof Error ? err.stack : undefined,
+          },
+          `Remotion renderMedia failed on attempt ${attempt}`,
+        );
+      }
     }
 
-    // Verify the output file was actually created with non-zero size
-    if (!fs.existsSync(outputLocation)) {
-      const missingErr = new Error(
-        `Remotion render completed but output file is missing: ${outputLocation}`,
-      );
-      logger.error(
-        { videoID: id, outputLocation },
-        missingErr.message,
-      );
-      throw missingErr;
-    }
-
-    const stat = fs.statSync(outputLocation);
-    if (stat.size === 0) {
-      const emptyErr = new Error(
-        `Remotion render completed but output file is empty (0 bytes): ${outputLocation}`,
-      );
-      logger.error(
-        { videoID: id, outputLocation, fileSizeBytes: stat.size },
-        emptyErr.message,
-      );
-      throw emptyErr;
-    }
-
-    logger.info(
-      {
-        outputLocation,
-        component,
-        videoID: id,
-        fileSizeBytes: stat.size,
-      },
-      "Video rendered successfully with Remotion",
-    );
+    // All attempts exhausted
+    throw lastRenderError;
   }
 
   async testRender(outputLocation: string) {
